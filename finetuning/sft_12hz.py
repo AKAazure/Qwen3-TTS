@@ -38,17 +38,23 @@ def train():
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--num_epochs", type=int, default=3)
+    parser.add_argument("--checkpoint_interval_epochs", type=int, default=1)
+    parser.add_argument("--keep_last_checkpoints", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     args = parser.parse_args()
+    if args.checkpoint_interval_epochs <= 0:
+        raise ValueError("checkpoint_interval_epochs must be positive")
+    if args.keep_last_checkpoints <= 0:
+        raise ValueError("keep_last_checkpoints must be positive")
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
 
     MODEL_PATH = args.init_model_path
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
@@ -115,7 +121,7 @@ def train():
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    accelerator.clip_grad_norm_(model.parameters(), 2.0)
 
                 optimizer.step()
                 optimizer.zero_grad()
@@ -123,8 +129,9 @@ def train():
             if step % 10 == 0:
                 accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
 
-        if accelerator.is_main_process:
-            output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
+        should_save_checkpoint = ((epoch + 1) % args.checkpoint_interval_epochs == 0) or (epoch + 1 == num_epochs)
+        if accelerator.is_main_process and should_save_checkpoint:
+            output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch + 1}")
             shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
 
             input_config_file = os.path.join(MODEL_PATH, "config.json")
@@ -156,6 +163,17 @@ def train():
             state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
+            print(f"Saved checkpoint: {output_dir}")
+            checkpoint_dirs = [
+                os.path.join(args.output_model_path, name)
+                for name in os.listdir(args.output_model_path)
+                if name.startswith("checkpoint-epoch-")
+                and os.path.isdir(os.path.join(args.output_model_path, name))
+            ]
+            checkpoint_dirs.sort(key=lambda path: os.path.getmtime(path))
+            for checkpoint_to_delete in checkpoint_dirs[:-args.keep_last_checkpoints]:
+                shutil.rmtree(checkpoint_to_delete)
+                print(f"Deleted old checkpoint: {checkpoint_to_delete}")
 
 if __name__ == "__main__":
     train()
