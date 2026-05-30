@@ -234,9 +234,11 @@ def train():
     model.train()
 
     for epoch in range(num_epochs):
+        epoch_losses = []
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 loss = compute_finetune_loss(model, batch, capture_target_speaker=True)
+                epoch_losses.append(float(loss.detach().float().item()))
 
                 accelerator.backward(loss)
 
@@ -249,6 +251,15 @@ def train():
             if step % 10 == 0:
                 accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
 
+        train_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else None
+        if train_loss is not None:
+            accelerator.print(f"Epoch {epoch + 1} | Train Loss: {train_loss:.4f}")
+            accelerator.print("SFT_TRAIN_JSON " + json.dumps(
+                {"epoch": epoch + 1, "train_loss": train_loss},
+                sort_keys=True,
+            ))
+
+        eval_loss = None
         should_evaluate = (
             eval_dataloader is not None
             and args.eval_interval_epochs > 0
@@ -275,6 +286,12 @@ def train():
                             overwrite=True,
                         )
                         print(f"Saved best checkpoint: {best_output_dir} eval_loss={eval_loss:.4f} epoch={epoch + 1}")
+
+        if train_loss is not None:
+            accelerator.print("SFT_EPOCH_JSON " + json.dumps(
+                {"epoch": epoch + 1, "train_loss": train_loss, "eval_loss": eval_loss},
+                sort_keys=True,
+            ))
 
         should_save_checkpoint = ((epoch + 1) % args.checkpoint_interval_epochs == 0) or (epoch + 1 == num_epochs)
         if accelerator.is_main_process and should_save_checkpoint:

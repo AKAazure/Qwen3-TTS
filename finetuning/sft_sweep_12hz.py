@@ -24,7 +24,59 @@ ALLOWED_SWEEP_PARAMS = {
     "max_eval_batches",
 }
 EVAL_JSON_PREFIX = "SFT_EVAL_JSON "
+TRAIN_JSON_PREFIX = "SFT_TRAIN_JSON "
+EPOCH_JSON_PREFIX = "SFT_EPOCH_JSON "
 EVAL_TEXT_PATTERN = re.compile(r"^Epoch\s+(?P<epoch>\d+)\s+\|\s+Eval Loss:\s+(?P<loss>[0-9.eE+-]+)")
+TRAIN_TEXT_PATTERN = re.compile(r"^Epoch\s+(?P<epoch>\d+)\s+\|\s+Train Loss:\s+(?P<loss>[0-9.eE+-]+)")
+SMOKE_SAMPLE_SCRIPT = r"""
+import argparse
+
+import soundfile as sf
+import torch
+from qwen_tts import Qwen3TTSModel
+
+
+def torch_dtype(name):
+    if name == "auto":
+        return None
+    return {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[name]
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--checkpoint_path", required=True)
+parser.add_argument("--output_path", required=True)
+parser.add_argument("--text", required=True)
+parser.add_argument("--speaker", required=True)
+parser.add_argument("--language", required=True)
+parser.add_argument("--instruct", default="")
+parser.add_argument("--dtype", default="float16", choices=["auto", "bfloat16", "float16", "float32"])
+parser.add_argument("--attn_implementation", default="sdpa", choices=["none", "eager", "sdpa"])
+args = parser.parse_args()
+
+load_kwargs = {"device_map": "auto"}
+dtype = torch_dtype(args.dtype)
+if dtype is not None:
+    load_kwargs["dtype"] = dtype
+if args.attn_implementation != "none":
+    load_kwargs["attn_implementation"] = args.attn_implementation
+
+model = Qwen3TTSModel.from_pretrained(args.checkpoint_path, **load_kwargs)
+generation_kwargs = {
+    "text": args.text,
+    "speaker": args.speaker,
+    "language": args.language,
+}
+if args.instruct.strip():
+    generation_kwargs["instruct"] = args.instruct.strip()
+wavs, sample_rate = model.generate_custom_voice(**generation_kwargs)
+sf.write(args.output_path, wavs[0], sample_rate)
+print(f"smoke_wav={args.output_path}")
+print(f"sample_rate={int(sample_rate)}")
+"""
 
 
 def main():
@@ -39,7 +91,9 @@ def main():
         encoding="utf-8",
     )
     trials_jsonl = output_root / "trials.jsonl"
+    samples_jsonl = output_root / "samples.jsonl"
     trials_jsonl.write_text("", encoding="utf-8")
+    samples_jsonl.write_text("", encoding="utf-8")
 
     method = config.get("method", "grid")
     if method == "grid":
@@ -82,6 +136,12 @@ def parse_args():
     parser.add_argument("--eval_batch_size", type=int, default=0)
     parser.add_argument("--max_eval_batches", type=int, default=0)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument("--smoke_text", type=str, default=None)
+    parser.add_argument("--smoke_language", type=str, default="Japanese")
+    parser.add_argument("--smoke_instruct", type=str, default="")
+    parser.add_argument("--smoke_output_dir", type=str, default=None)
+    parser.add_argument("--smoke_dtype", type=str, default="float16", choices=["auto", "bfloat16", "float16", "float32"])
+    parser.add_argument("--smoke_attn_implementation", type=str, default="sdpa", choices=["none", "eager", "sdpa"])
     parser.add_argument("--sweep_config_json", type=str, default=None)
     parser.add_argument("--sweep_config_path", type=str, default=None)
     parser.add_argument("--promote_best_to", type=str, default=None)
@@ -92,6 +152,8 @@ def parse_args():
         raise ValueError("pass exactly one of --sweep_config_json or --sweep_config_path")
     if not args.dry_run and not args.eval_jsonl:
         raise ValueError("eval_jsonl is required unless --dry_run is set")
+    if args.smoke_text is not None and not args.smoke_text.strip():
+        raise ValueError("smoke_text must not be empty when provided")
     validate_training_args(vars(args))
     return args
 
@@ -289,20 +351,35 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
     trial_dir = output_root / "trials" / trial_id
     trial_dir.mkdir(parents=True, exist_ok=True)
     log_path = trial_dir / "sft_12hz.log"
+    metrics_path = trial_dir / "metrics.jsonl"
     merged_params = build_trial_params(args, params)
     validate_training_args({**base_param_defaults(), **merged_params})
     command = build_sft_command(args, trial_dir, merged_params)
+    metrics_path.write_text("", encoding="utf-8")
     record = {
         "trial_id": trial_id,
         "status": "dry_run" if dry_run else "running",
         "params": merged_params,
+        "checkpoint_policy": {
+            "checkpoint_interval_epochs": merged_params["num_epochs"],
+            "keep_last_checkpoints": 1,
+            "save_best_eval_checkpoint": False,
+        },
         "command": command,
         "output_model_path": str(trial_dir),
         "log_path": str(log_path),
+        "metrics_path": str(metrics_path),
+        "metrics_history": [],
+        "train_history": [],
         "eval_history": [],
+        "final_train_loss": None,
+        "final_eval_loss": None,
         "best_eval_loss": None,
         "best_eval_epoch": None,
-        "best_checkpoint_path": str(trial_dir / "checkpoint-best"),
+        "checkpoint_path": None,
+        "checkpoint_epoch": None,
+        "best_checkpoint_path": str(trial_dir / f"checkpoint-epoch-{merged_params['num_epochs']}"),
+        "sample": None,
         "returncode": None,
         "duration_sec": 0.0,
     }
@@ -329,16 +406,19 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
             print(line, end="")
             log_file.write(line)
             log_file.flush()
-            event = parse_eval_event(line)
-            if event:
-                updated = update_eval_record(record, event)
-                if updated and optuna_trial is not None:
+            for event in parse_metric_events(line):
+                updated = update_metric_record(record, event)
+                if updated["any"]:
+                    write_metrics_jsonl(metrics_path, record)
+                if updated["eval"] and optuna_trial is not None:
                     optuna_trial.report(event["eval_loss"], step=event["epoch"])
                     if optuna_trial.should_prune():
                         pruned = True
                         print(f"sweep_trial_pruned={trial_id} epoch={event['epoch']} eval_loss={event['eval_loss']}")
                         process.terminate()
                         break
+            if pruned:
+                break
         if pruned:
             try:
                 returncode = process.wait(timeout=60)
@@ -356,7 +436,13 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
         record["status"] = "completed"
         checkpoint = find_trial_checkpoint(trial_dir)
         if checkpoint:
+            record["checkpoint_path"] = str(checkpoint)
+            record["checkpoint_epoch"] = checkpoint_epoch_number(checkpoint)
             record["best_checkpoint_path"] = str(checkpoint)
+            sample = generate_smoke_sample(args, record, Path(checkpoint))
+            if sample is not None:
+                record["sample"] = sample
+                append_jsonl(Path(args.output_root) / "samples.jsonl", sample)
     else:
         record["status"] = "failed"
     (trial_dir / "trial.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -401,9 +487,9 @@ def build_sft_command(args, trial_dir, params):
         "--num_epochs",
         str(params["num_epochs"]),
         "--checkpoint_interval_epochs",
-        str(args.checkpoint_interval_epochs),
+        str(params["num_epochs"]),
         "--keep_last_checkpoints",
-        str(args.keep_last_checkpoints),
+        "1",
         "--speaker_name",
         str(args.speaker_name),
     ]
@@ -417,35 +503,94 @@ def build_sft_command(args, trial_dir, params):
             str(params["eval_batch_size"]),
             "--max_eval_batches",
             str(params["max_eval_batches"]),
-            "--save_best_eval_checkpoint",
-            "--best_checkpoint_name",
-            "checkpoint-best",
         ])
     return command
 
 
-def parse_eval_event(line):
+def parse_metric_events(line):
     if line.startswith(EVAL_JSON_PREFIX):
         try:
             payload = json.loads(line[len(EVAL_JSON_PREFIX):])
         except json.JSONDecodeError:
-            return None
-        return {"epoch": int(payload["epoch"]), "eval_loss": float(payload["eval_loss"])}
-    match = EVAL_TEXT_PATTERN.match(line.strip())
-    if not match:
-        return None
-    return {"epoch": int(match.group("epoch")), "eval_loss": float(match.group("loss"))}
+            return []
+        return [{"epoch": int(payload["epoch"]), "eval_loss": float(payload["eval_loss"])}]
+    if line.startswith(TRAIN_JSON_PREFIX):
+        try:
+            payload = json.loads(line[len(TRAIN_JSON_PREFIX):])
+        except json.JSONDecodeError:
+            return []
+        return [{"epoch": int(payload["epoch"]), "train_loss": float(payload["train_loss"])}]
+    if line.startswith(EPOCH_JSON_PREFIX):
+        try:
+            payload = json.loads(line[len(EPOCH_JSON_PREFIX):])
+        except json.JSONDecodeError:
+            return []
+        event = {"epoch": int(payload["epoch"])}
+        if payload.get("train_loss") is not None:
+            event["train_loss"] = float(payload["train_loss"])
+        if payload.get("eval_loss") is not None:
+            event["eval_loss"] = float(payload["eval_loss"])
+        return [event]
+    stripped = line.strip()
+    match = EVAL_TEXT_PATTERN.match(stripped)
+    if match:
+        return [{"epoch": int(match.group("epoch")), "eval_loss": float(match.group("loss"))}]
+    match = TRAIN_TEXT_PATTERN.match(stripped)
+    if match:
+        return [{"epoch": int(match.group("epoch")), "train_loss": float(match.group("loss"))}]
+    return []
 
 
-def update_eval_record(record, event):
-    for existing in record["eval_history"]:
-        if existing["epoch"] == event["epoch"] and existing["eval_loss"] == event["eval_loss"]:
-            return False
-    record["eval_history"].append(event)
-    if record["best_eval_loss"] is None or event["eval_loss"] < record["best_eval_loss"]:
-        record["best_eval_loss"] = event["eval_loss"]
-        record["best_eval_epoch"] = event["epoch"]
-    return True
+def update_metric_record(record, event):
+    changed = {"any": False, "train": False, "eval": False}
+    epoch = int(event["epoch"])
+    metrics = None
+    for existing in record["metrics_history"]:
+        if existing["epoch"] == epoch:
+            metrics = existing
+            break
+    if metrics is None:
+        metrics = {"epoch": epoch}
+        record["metrics_history"].append(metrics)
+
+    if "train_loss" in event:
+        train_loss = float(event["train_loss"])
+        if metrics.get("train_loss") != train_loss:
+            metrics["train_loss"] = train_loss
+            upsert_epoch_history(record["train_history"], epoch, "train_loss", train_loss)
+            record["final_train_loss"] = train_loss
+            changed["any"] = True
+            changed["train"] = True
+    if "eval_loss" in event:
+        eval_loss = float(event["eval_loss"])
+        if metrics.get("eval_loss") != eval_loss:
+            metrics["eval_loss"] = eval_loss
+            upsert_epoch_history(record["eval_history"], epoch, "eval_loss", eval_loss)
+            record["final_eval_loss"] = eval_loss
+            if record["best_eval_loss"] is None or eval_loss < record["best_eval_loss"]:
+                record["best_eval_loss"] = eval_loss
+                record["best_eval_epoch"] = epoch
+            changed["any"] = True
+            changed["eval"] = True
+
+    record["metrics_history"].sort(key=lambda item: item["epoch"])
+    record["train_history"].sort(key=lambda item: item["epoch"])
+    record["eval_history"].sort(key=lambda item: item["epoch"])
+    return changed
+
+
+def upsert_epoch_history(history, epoch, key, value):
+    for existing in history:
+        if existing["epoch"] == epoch:
+            existing[key] = value
+            return
+    history.append({"epoch": epoch, key: value})
+
+
+def write_metrics_jsonl(path, record):
+    with Path(path).open("w", encoding="utf-8") as output_file:
+        for metrics in record["metrics_history"]:
+            output_file.write(json.dumps(metrics, sort_keys=True) + "\n")
 
 
 def select_best_trial(records):
@@ -460,9 +605,6 @@ def select_best_trial(records):
 
 
 def find_trial_checkpoint(trial_dir):
-    best_checkpoint = trial_dir / "checkpoint-best"
-    if best_checkpoint.exists():
-        return best_checkpoint
     candidates = [
         path
         for path in trial_dir.glob("checkpoint-epoch-*")
@@ -491,9 +633,107 @@ def promote_best_checkpoint(best, target):
     return str(target)
 
 
+def generate_smoke_sample(args, record, checkpoint):
+    if not args.smoke_text:
+        return None
+
+    sample_dir = Path(args.smoke_output_dir) if args.smoke_output_dir else Path(args.output_root) / "samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    sample_path = sample_dir / sample_filename(record)
+    sample_log_path = sample_path.with_suffix(".log")
+    metadata_path = sample_path.with_suffix(".json")
+    command = build_smoke_command(args, checkpoint, sample_path)
+
+    start_time = time.monotonic()
+    with sample_log_path.open("w", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=str(Path(__file__).resolve().parent),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="")
+            log_file.write(line)
+            log_file.flush()
+        returncode = process.wait()
+    if returncode != 0:
+        raise RuntimeError(f"smoke sample failed for {record['trial_id']} with exit code {returncode}; see {sample_log_path}")
+    if not sample_path.exists() or sample_path.stat().st_size == 0:
+        raise RuntimeError(f"smoke sample is missing or empty: {sample_path}")
+
+    metadata = {
+        "trial_id": record["trial_id"],
+        "epoch": record["checkpoint_epoch"],
+        "checkpoint_path": str(checkpoint),
+        "sample_path": str(sample_path),
+        "sample_log_path": str(sample_log_path),
+        "sample_metadata_path": str(metadata_path),
+        "text": args.smoke_text,
+        "language": args.smoke_language,
+        "instruct": args.smoke_instruct,
+        "params": record["params"],
+        "best_eval_loss": record["best_eval_loss"],
+        "best_eval_epoch": record["best_eval_epoch"],
+        "final_train_loss": record["final_train_loss"],
+        "final_eval_loss": record["final_eval_loss"],
+        "duration_sec": round(time.monotonic() - start_time, 3),
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"smoke_sample={sample_path}")
+    print(f"smoke_sample_metadata={metadata_path}")
+    return metadata
+
+
+def sample_filename(record):
+    params = record["params"]
+    parts = [
+        record["trial_id"],
+        f"epoch-{record['checkpoint_epoch']}",
+        f"lr-{param_slug(params['lr'])}",
+        f"wd-{param_slug(params['weight_decay'])}",
+        f"clip-{param_slug(params['grad_clip_max_norm'])}",
+        f"b{params['batch_size']}",
+    ]
+    return "_".join(parts) + ".wav"
+
+
+def param_slug(value):
+    return f"{float(value):.6g}".replace("-", "m").replace("+", "").replace(".", "p")
+
+
+def build_smoke_command(args, checkpoint, sample_path):
+    command = [
+        sys.executable,
+        "-u",
+        "-c",
+        SMOKE_SAMPLE_SCRIPT,
+        "--checkpoint_path",
+        str(checkpoint),
+        "--output_path",
+        str(sample_path),
+        "--text",
+        args.smoke_text,
+        "--speaker",
+        str(args.speaker_name),
+        "--language",
+        str(args.smoke_language),
+        "--dtype",
+        str(args.smoke_dtype),
+        "--attn_implementation",
+        str(args.smoke_attn_implementation),
+    ]
+    if args.smoke_instruct:
+        command.extend(["--instruct", args.smoke_instruct])
+    return command
+
+
 def append_jsonl(path, record):
     with Path(path).open("a", encoding="utf-8") as output_file:
-        output_file.write(json.dumps(record, sort_keys=True) + "\n")
+        output_file.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":
