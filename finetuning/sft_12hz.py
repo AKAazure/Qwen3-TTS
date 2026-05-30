@@ -97,6 +97,42 @@ def evaluate(model, eval_dataloader, accelerator, *, max_eval_batches=0):
     return torch.cat(eval_losses).mean().item()
 
 
+def save_checkpoint(model, accelerator, *, model_path, output_dir, speaker_name, overwrite=False):
+    if overwrite and os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    shutil.copytree(model_path, output_dir, dirs_exist_ok=True)
+
+    input_config_file = os.path.join(model_path, "config.json")
+    output_config_file = os.path.join(output_dir, "config.json")
+    with open(input_config_file, 'r', encoding='utf-8') as f:
+        config_dict = json.load(f)
+    config_dict["tts_model_type"] = "custom_voice"
+    talker_config = config_dict.get("talker_config", {})
+    talker_config["spk_id"] = {
+        speaker_name: 3000
+    }
+    talker_config["spk_is_dialect"] = {
+        speaker_name: False
+    }
+    config_dict["talker_config"] = talker_config
+
+    with open(output_config_file, 'w', encoding='utf-8') as f:
+        json.dump(config_dict, f, indent=2, ensure_ascii=False)
+
+    unwrapped_model = accelerator.unwrap_model(model)
+    state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
+
+    drop_prefix = "speaker_encoder"
+    keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
+    for k in keys_to_drop:
+        del state_dict[k]
+
+    weight = state_dict['talker.model.codec_embedding.weight']
+    state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
+    save_path = os.path.join(output_dir, "model.safetensors")
+    save_file(state_dict, save_path)
+
+
 def train():
     global target_speaker_embedding
 
@@ -115,6 +151,8 @@ def train():
     parser.add_argument("--eval_interval_epochs", type=int, default=1)
     parser.add_argument("--eval_batch_size", type=int, default=0)
     parser.add_argument("--max_eval_batches", type=int, default=0)
+    parser.add_argument("--save_best_eval_checkpoint", action="store_true")
+    parser.add_argument("--best_checkpoint_name", type=str, default="checkpoint-best")
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     args = parser.parse_args()
     if args.checkpoint_interval_epochs <= 0:
@@ -131,6 +169,12 @@ def train():
         raise ValueError("eval_batch_size must be non-negative")
     if args.max_eval_batches < 0:
         raise ValueError("max_eval_batches must be non-negative")
+    if args.save_best_eval_checkpoint and not args.eval_jsonl:
+        raise ValueError("save_best_eval_checkpoint requires eval_jsonl")
+    if not args.best_checkpoint_name.strip():
+        raise ValueError("best_checkpoint_name must not be empty")
+    if os.path.basename(args.best_checkpoint_name) != args.best_checkpoint_name:
+        raise ValueError("best_checkpoint_name must be a single directory name")
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
 
@@ -172,6 +216,7 @@ def train():
         )
 
     num_epochs = args.num_epochs
+    best_eval_loss = None
     model.train()
 
     for epoch in range(num_epochs):
@@ -199,41 +244,34 @@ def train():
             eval_loss = evaluate(model, eval_dataloader, accelerator, max_eval_batches=args.max_eval_batches)
             if eval_loss is not None:
                 accelerator.print(f"Epoch {epoch + 1} | Eval Loss: {eval_loss:.4f}")
+                accelerator.print("SFT_EVAL_JSON " + json.dumps(
+                    {"epoch": epoch + 1, "eval_loss": eval_loss},
+                    sort_keys=True,
+                ))
+                if best_eval_loss is None or eval_loss < best_eval_loss:
+                    best_eval_loss = eval_loss
+                    if accelerator.is_main_process and args.save_best_eval_checkpoint:
+                        best_output_dir = os.path.join(args.output_model_path, args.best_checkpoint_name)
+                        save_checkpoint(
+                            model,
+                            accelerator,
+                            model_path=MODEL_PATH,
+                            output_dir=best_output_dir,
+                            speaker_name=args.speaker_name,
+                            overwrite=True,
+                        )
+                        print(f"Saved best checkpoint: {best_output_dir} eval_loss={eval_loss:.4f} epoch={epoch + 1}")
 
         should_save_checkpoint = ((epoch + 1) % args.checkpoint_interval_epochs == 0) or (epoch + 1 == num_epochs)
         if accelerator.is_main_process and should_save_checkpoint:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch + 1}")
-            shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
-
-            input_config_file = os.path.join(MODEL_PATH, "config.json")
-            output_config_file = os.path.join(output_dir, "config.json")
-            with open(input_config_file, 'r', encoding='utf-8') as f:
-                config_dict = json.load(f)
-            config_dict["tts_model_type"] = "custom_voice"
-            talker_config = config_dict.get("talker_config", {})
-            talker_config["spk_id"] = {
-                args.speaker_name: 3000
-            }
-            talker_config["spk_is_dialect"] = {
-                args.speaker_name: False
-            }
-            config_dict["talker_config"] = talker_config
-
-            with open(output_config_file, 'w', encoding='utf-8') as f:
-                json.dump(config_dict, f, indent=2, ensure_ascii=False)
-
-            unwrapped_model = accelerator.unwrap_model(model)
-            state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
-
-            drop_prefix = "speaker_encoder"
-            keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
-            for k in keys_to_drop:
-                del state_dict[k]
-
-            weight = state_dict['talker.model.codec_embedding.weight']
-            state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
-            save_path = os.path.join(output_dir, "model.safetensors")
-            save_file(state_dict, save_path)
+            save_checkpoint(
+                model,
+                accelerator,
+                model_path=MODEL_PATH,
+                output_dir=output_dir,
+                speaker_name=args.speaker_name,
+            )
             print(f"Saved checkpoint: {output_dir}")
             checkpoint_dirs = [
                 os.path.join(args.output_model_path, name)
