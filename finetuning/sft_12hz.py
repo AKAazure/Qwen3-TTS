@@ -106,6 +106,8 @@ def train():
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--grad_clip_max_norm", type=float, default=2.0)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--checkpoint_interval_epochs", type=int, default=1)
     parser.add_argument("--keep_last_checkpoints", type=int, default=3)
@@ -119,6 +121,10 @@ def train():
         raise ValueError("checkpoint_interval_epochs must be positive")
     if args.keep_last_checkpoints <= 0:
         raise ValueError("keep_last_checkpoints must be positive")
+    if args.weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative")
+    if args.grad_clip_max_norm < 0:
+        raise ValueError("grad_clip_max_norm must be non-negative")
     if args.eval_interval_epochs < 0:
         raise ValueError("eval_interval_epochs must be non-negative")
     if args.eval_batch_size < 0:
@@ -154,7 +160,7 @@ def train():
             collate_fn=eval_dataset.collate_fn,
         )
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     if eval_dataloader is None:
         model, optimizer, train_dataloader = accelerator.prepare(
@@ -175,8 +181,8 @@ def train():
 
                 accelerator.backward(loss)
 
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 2.0)
+                if accelerator.sync_gradients and args.grad_clip_max_norm > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), args.grad_clip_max_norm)
 
                 optimizer.step()
                 optimizer.zero_grad()
