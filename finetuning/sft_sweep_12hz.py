@@ -26,6 +26,7 @@ ALLOWED_SWEEP_PARAMS = {
 EVAL_JSON_PREFIX = "SFT_EVAL_JSON "
 TRAIN_JSON_PREFIX = "SFT_TRAIN_JSON "
 EPOCH_JSON_PREFIX = "SFT_EPOCH_JSON "
+SWEEP_TRIAL_JSON_PREFIX = "SFT_SWEEP_TRIAL_JSON "
 EVAL_TEXT_PATTERN = re.compile(r"^Epoch\s+(?P<epoch>\d+)\s+\|\s+Eval Loss:\s+(?P<loss>[0-9.eE+-]+)")
 TRAIN_TEXT_PATTERN = re.compile(r"^Epoch\s+(?P<epoch>\d+)\s+\|\s+Train Loss:\s+(?P<loss>[0-9.eE+-]+)")
 SMOKE_SAMPLE_SCRIPT = r"""
@@ -108,14 +109,23 @@ def main():
         print("best_trial=none")
         return 0 if args.dry_run else 1
 
+    promoted = None
+    if args.promote_best_to and not args.dry_run:
+        promoted = promote_best_checkpoint(best, Path(args.promote_best_to))
+        best["promoted_checkpoint_path"] = promoted
+        print(f"promoted_checkpoint={promoted}")
+    if not args.dry_run:
+        deleted_checkpoints = delete_trial_checkpoints(output_root)
+        mark_deleted_checkpoints(records, deleted_checkpoints)
+        rewrite_trial_records(records, trials_jsonl)
+        best["trial_checkpoints_deleted"] = len(deleted_checkpoints)
+        print(f"trial_checkpoints_deleted={len(deleted_checkpoints)}")
+
     best_path = output_root / "best_trial.json"
     best_path.write_text(json.dumps(best, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"best_trial_json={best_path}")
     print(f"best_trial_id={best['trial_id']}")
     print(f"best_eval_loss={best['best_eval_loss']}")
-    if args.promote_best_to and not args.dry_run:
-        promoted = promote_best_checkpoint(best, Path(args.promote_best_to))
-        print(f"promoted_checkpoint={promoted}")
     return 0
 
 
@@ -363,6 +373,7 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
         "checkpoint_policy": {
             "checkpoint_interval_epochs": merged_params["num_epochs"],
             "keep_last_checkpoints": 1,
+            "retain_trial_checkpoints": False,
             "save_best_eval_checkpoint": False,
         },
         "command": command,
@@ -379,12 +390,17 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
         "checkpoint_path": None,
         "checkpoint_epoch": None,
         "best_checkpoint_path": str(trial_dir / f"checkpoint-epoch-{merged_params['num_epochs']}"),
+        "promoted_checkpoint_path": None,
+        "checkpoint_deleted": False,
+        "best_checkpoint_deleted": False,
         "sample": None,
         "returncode": None,
         "duration_sec": 0.0,
     }
     (trial_dir / "trial.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"sweep_trial={trial_id}")
+    print(SWEEP_TRIAL_JSON_PREFIX + json.dumps({"trial_id": trial_id, "params": merged_params}, sort_keys=True))
+    print(f"sweep_trial_hyperparams={trial_id} {format_trial_params(merged_params)}")
     print("sweep_command=" + " ".join(command))
     if dry_run:
         return record
@@ -633,6 +649,38 @@ def promote_best_checkpoint(best, target):
     return str(target)
 
 
+def delete_trial_checkpoints(output_root):
+    deleted = []
+    for checkpoint in sorted(Path(output_root).glob("trials/trial-*/checkpoint-epoch-*")):
+        if checkpoint.is_dir():
+            shutil.rmtree(checkpoint)
+            deleted.append(str(checkpoint))
+            print(f"deleted_trial_checkpoint={checkpoint}")
+    return deleted
+
+
+def mark_deleted_checkpoints(records, deleted_checkpoints):
+    deleted = set(deleted_checkpoints)
+    for record in records:
+        checkpoint_path = record.get("checkpoint_path")
+        if checkpoint_path in deleted:
+            record["checkpoint_path"] = None
+            record["checkpoint_deleted"] = True
+        best_checkpoint_path = record.get("best_checkpoint_path")
+        if best_checkpoint_path in deleted:
+            record["best_checkpoint_path"] = None
+            record["best_checkpoint_deleted"] = True
+
+
+def rewrite_trial_records(records, trials_jsonl):
+    trials_jsonl = Path(trials_jsonl)
+    trials_jsonl.write_text("", encoding="utf-8")
+    for record in records:
+        append_jsonl(trials_jsonl, record)
+        trial_json = Path(record["output_model_path"]) / "trial.json"
+        trial_json.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def generate_smoke_sample(args, record, checkpoint):
     if not args.smoke_text:
         return None
@@ -691,18 +739,43 @@ def generate_smoke_sample(args, record, checkpoint):
 def sample_filename(record):
     params = record["params"]
     parts = [
-        record["trial_id"],
-        f"epoch-{record['checkpoint_epoch']}",
-        f"lr-{param_slug(params['lr'])}",
-        f"wd-{param_slug(params['weight_decay'])}",
-        f"clip-{param_slug(params['grad_clip_max_norm'])}",
         f"b{params['batch_size']}",
+        f"lr{format_sample_param(params['lr'])}",
+        f"norm{format_sample_param(params['grad_clip_max_norm'])}",
+        f"l{format_sample_param(params['weight_decay'])}",
+        record["trial_id"].replace("-", ""),
+        f"epoch{record['checkpoint_epoch']}",
     ]
     return "_".join(parts) + ".wav"
 
 
-def param_slug(value):
-    return f"{float(value):.6g}".replace("-", "m").replace("+", "").replace(".", "p")
+def format_trial_params(params):
+    ordered = [
+        ("batch_size", params["batch_size"]),
+        ("lr", params["lr"]),
+        ("weight_decay", params["weight_decay"]),
+        ("grad_clip_max_norm", params["grad_clip_max_norm"]),
+        ("num_epochs", params["num_epochs"]),
+        ("eval_batch_size", params["eval_batch_size"]),
+        ("max_eval_batches", params["max_eval_batches"]),
+    ]
+    return " ".join(f"{name}={format_sample_param(value)}" for name, value in ordered)
+
+
+def format_sample_param(value):
+    if isinstance(value, int):
+        return str(value)
+    value = float(value)
+    if value.is_integer():
+        return str(int(value))
+    text = str(value)
+    if "e" in text:
+        return text
+    if 0 < abs(value) < 0.1:
+        mantissa, exponent = f"{value:.12e}".split("e")
+        mantissa = mantissa.rstrip("0").rstrip(".")
+        return f"{mantissa}e{int(exponent)}"
+    return text
 
 
 def build_smoke_command(args, checkpoint, sample_path):
