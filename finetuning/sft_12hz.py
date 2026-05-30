@@ -46,6 +46,7 @@ def compute_finetune_loss(model, batch, *, capture_target_speaker=False):
     attention_mask = batch['attention_mask']
     codec_0_labels = batch['codec_0_labels']
     codec_mask = batch['codec_mask']
+    speaker_embedding_mask = batch.get('speaker_embedding_mask')
 
     speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
     if capture_target_speaker and target_speaker_embedding is None:
@@ -56,7 +57,7 @@ def compute_finetune_loss(model, batch, *, capture_target_speaker=False):
 
     input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
     input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-    input_codec_embedding[:, 6, :] = speaker_embedding
+    _place_speaker_embedding(input_codec_embedding, speaker_embedding, speaker_embedding_mask)
 
     input_embeddings = input_text_embedding + input_codec_embedding
 
@@ -78,6 +79,19 @@ def compute_finetune_loss(model, batch, *, capture_target_speaker=False):
 
     _, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
     return outputs.loss + 0.3 * sub_talker_loss
+
+
+def _place_speaker_embedding(input_codec_embedding, speaker_embedding, speaker_embedding_mask=None):
+    """Place each sample's speaker embedding at its dataset-defined speaker slot."""
+    if speaker_embedding_mask is None:
+        input_codec_embedding[:, 6, :] = speaker_embedding
+        return
+
+    for row_index in range(input_codec_embedding.shape[0]):
+        positions = torch.nonzero(speaker_embedding_mask[row_index], as_tuple=False).flatten()
+        if positions.numel() != 1:
+            raise ValueError("speaker_embedding_mask must contain exactly one True value per sample")
+        input_codec_embedding[row_index, positions.item(), :] = speaker_embedding[row_index]
 
 
 def evaluate(model, eval_dataloader, accelerator, *, max_eval_batches=0):

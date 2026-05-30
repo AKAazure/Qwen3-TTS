@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, List, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import librosa
 import numpy as np
@@ -90,6 +90,9 @@ class TTSDataset(Dataset):
     
     def _build_assistant_text(self, text: str) -> str:
         return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+
+    def _build_instruct_text(self, instruct: str) -> str:
+        return f"<|im_start|>user\n{instruct}<|im_end|>\n"
     
     def _ensure_list(self, x: MaybeList) -> List[Any]:
         return x if isinstance(x, list) else [x]
@@ -125,9 +128,16 @@ class TTSDataset(Dataset):
         audio_codes = item["audio_codes"]
         language        = item.get('language','Auto')
         ref_audio_path  = item['ref_audio']
+        instruct        = item.get('instruct', '')
+        if instruct is None:
+            instruct = ''
+        if not isinstance(instruct, str):
+            raise TypeError("instruct must be a string when provided")
+        instruct = instruct.strip()
 
         text = self._build_assistant_text(text)
         text_ids = self._tokenize_texts(text)
+        instruct_ids = self._tokenize_texts(self._build_instruct_text(instruct)) if instruct else None
 
         audio_codes = torch.tensor(audio_codes, dtype=torch.long)
 
@@ -139,6 +149,7 @@ class TTSDataset(Dataset):
 
         return {
             "text_ids": text_ids[:,:-5],    # 1 , t
+            "instruct_ids": instruct_ids,
             "audio_codes":audio_codes,      # t, 16
             "ref_mel":ref_mel
         }
@@ -146,7 +157,10 @@ class TTSDataset(Dataset):
     def collate_fn(self, batch):
         assert self.lag_num == -1
 
-        item_length = [b['text_ids'].shape[1] + b['audio_codes'].shape[0] for b in batch]
+        item_length = [
+            self._instruct_len(b.get('instruct_ids')) + b['text_ids'].shape[1] + b['audio_codes'].shape[0]
+            for b in batch
+        ]
         max_length = max(item_length) + 8
         b,t = len(batch),max_length
 
@@ -157,27 +171,36 @@ class TTSDataset(Dataset):
         codec_mask      = torch.zeros((b,t),dtype=torch.bool)
         attention_mask  = torch.zeros((b,t),dtype=torch.long)
         codec_0_labels  = torch.full((b, t), -100, dtype=torch.long)
+        speaker_embedding_mask = torch.zeros((b,t),dtype=torch.bool)
 
         for i,data in enumerate(batch):
+            instruct_ids    = data.get('instruct_ids')
             text_ids        = data['text_ids']
             audio_codec_0   = data['audio_codes'][:,0]
             audio_codecs    = data['audio_codes']
 
+            instruct_ids_len = self._instruct_len(instruct_ids)
             text_ids_len = text_ids.shape[1]
             codec_ids_len = audio_codec_0.shape[0]
+
+            if instruct_ids is not None:
+                input_ids[i, :instruct_ids_len, 0] = instruct_ids[0]
+                text_embedding_mask[i, :instruct_ids_len] = True
+                attention_mask[i, :instruct_ids_len] = True
+            base = instruct_ids_len
             
             # text channel
-            input_ids[i,  :3, 0] = text_ids[0,:3]
-            input_ids[i, 3:7, 0] = self.config.tts_pad_token_id
-            input_ids[i,   7, 0] = self.config.tts_bos_token_id
-            input_ids[i, 8:8+text_ids_len-3, 0] = text_ids[0,3:]
-            input_ids[i,   8+text_ids_len-3, 0] = self.config.tts_eos_token_id
-            input_ids[i, 8+text_ids_len-2:8+text_ids_len+codec_ids_len , 0] = self.config.tts_pad_token_id
-            text_embedding_mask[i,  :8+text_ids_len+codec_ids_len] = True
+            input_ids[i,  base:base+3, 0] = text_ids[0,:3]
+            input_ids[i, base+3:base+7, 0] = self.config.tts_pad_token_id
+            input_ids[i,   base+7, 0] = self.config.tts_bos_token_id
+            input_ids[i, base+8:base+8+text_ids_len-3, 0] = text_ids[0,3:]
+            input_ids[i,   base+8+text_ids_len-3, 0] = self.config.tts_eos_token_id
+            input_ids[i, base+8+text_ids_len-2:base+8+text_ids_len+codec_ids_len , 0] = self.config.tts_pad_token_id
+            text_embedding_mask[i,  :base+8+text_ids_len+codec_ids_len] = True
 
             # codec channel
             # input_ids[i,   :3, 1] = 0
-            input_ids[i,    3:8 ,1] = torch.tensor(
+            input_ids[i,    base+3:base+8 ,1] = torch.tensor(
                                         [
                                             self.config.talker_config.codec_nothink_id,
                                             self.config.talker_config.codec_think_bos_id,
@@ -186,22 +209,23 @@ class TTSDataset(Dataset):
                                             self.config.talker_config.codec_pad_id       
                                         ]
                                     )
-            input_ids[i,    8:8+text_ids_len-3  ,1] = self.config.talker_config.codec_pad_id
-            input_ids[i,    8+text_ids_len-3    ,1] = self.config.talker_config.codec_pad_id
-            input_ids[i,    8+text_ids_len-2    ,1] = self.config.talker_config.codec_bos_id
-            input_ids[i,    8+text_ids_len-1:8+text_ids_len-1+codec_ids_len,    1] = audio_codec_0
-            input_ids[i,    8+text_ids_len-1+codec_ids_len,    1] = self.config.talker_config.codec_eos_token_id
+            input_ids[i,    base+8:base+8+text_ids_len-3  ,1] = self.config.talker_config.codec_pad_id
+            input_ids[i,    base+8+text_ids_len-3    ,1] = self.config.talker_config.codec_pad_id
+            input_ids[i,    base+8+text_ids_len-2    ,1] = self.config.talker_config.codec_bos_id
+            input_ids[i,    base+8+text_ids_len-1:base+8+text_ids_len-1+codec_ids_len,    1] = audio_codec_0
+            input_ids[i,    base+8+text_ids_len-1+codec_ids_len,    1] = self.config.talker_config.codec_eos_token_id
 
-            codec_0_labels[i,    8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = audio_codec_0
-            codec_0_labels[i,    8+text_ids_len-1+codec_ids_len] = self.config.talker_config.codec_eos_token_id
+            codec_0_labels[i,    base+8+text_ids_len-1:base+8+text_ids_len-1+codec_ids_len] = audio_codec_0
+            codec_0_labels[i,    base+8+text_ids_len-1+codec_ids_len] = self.config.talker_config.codec_eos_token_id
 
-            codec_ids[i, 8+text_ids_len-1:8+text_ids_len-1+codec_ids_len,:] = audio_codecs
+            codec_ids[i, base+8+text_ids_len-1:base+8+text_ids_len-1+codec_ids_len,:] = audio_codecs
 
-            codec_embedding_mask[i, 3:8+text_ids_len+codec_ids_len] = True
-            codec_embedding_mask[i, 6] = False       # for speaker embedding
+            codec_embedding_mask[i, base+3:base+8+text_ids_len+codec_ids_len] = True
+            codec_embedding_mask[i, base+6] = False       # for speaker embedding
+            speaker_embedding_mask[i, base+6] = True
 
-            codec_mask[i,   8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = True
-            attention_mask[i, :8+text_ids_len+codec_ids_len] = True
+            codec_mask[i,   base+8+text_ids_len-1:base+8+text_ids_len-1+codec_ids_len] = True
+            attention_mask[i, :base+8+text_ids_len+codec_ids_len] = True
         
         ref_mels = [data['ref_mel'] for data in batch]
         ref_mels = torch.cat(ref_mels,dim=0)
@@ -212,7 +236,11 @@ class TTSDataset(Dataset):
             'attention_mask':attention_mask,
             'text_embedding_mask':text_embedding_mask.unsqueeze(-1),
             'codec_embedding_mask':codec_embedding_mask.unsqueeze(-1),
+            'speaker_embedding_mask':speaker_embedding_mask,
             'codec_0_labels':codec_0_labels,
             'codec_ids': codec_ids,
             'codec_mask':codec_mask
         }
+
+    def _instruct_len(self, instruct_ids: Optional[torch.Tensor]) -> int:
+        return 0 if instruct_ids is None else instruct_ids.shape[1]
