@@ -19,14 +19,29 @@ ALLOWED_SWEEP_PARAMS = {
     "weight_decay",
     "grad_clip_max_norm",
     "batch_size",
+    "gradient_accumulation_steps",
+    "lr_scheduler",
+    "lr_warmup_steps",
+    "lr_warmup_ratio",
+    "lr_min_ratio",
     "num_epochs",
     "eval_batch_size",
     "max_eval_batches",
 }
+ALLOWED_LR_SCHEDULERS = {"constant", "linear", "cosine"}
 EVAL_JSON_PREFIX = "SFT_EVAL_JSON "
 TRAIN_JSON_PREFIX = "SFT_TRAIN_JSON "
 EPOCH_JSON_PREFIX = "SFT_EPOCH_JSON "
 SWEEP_TRIAL_JSON_PREFIX = "SFT_SWEEP_TRIAL_JSON "
+SWEEP_OVERFIT_JSON_PREFIX = "SFT_SWEEP_OVERFIT_JSON "
+BEST_CHECKPOINT_NAME = "checkpoint-best"
+DEFAULT_OVERFIT_STOP_CONFIG = {
+    "enabled": False,
+    "min_epochs": 10,
+    "patience": 3,
+    "min_eval_regression_ratio": 0.03,
+    "min_train_improvement_ratio": 0.02,
+}
 EVAL_TEXT_PATTERN = re.compile(r"^Epoch\s+(?P<epoch>\d+)\s+\|\s+Eval Loss:\s+(?P<loss>[0-9.eE+-]+)")
 TRAIN_TEXT_PATTERN = re.compile(r"^Epoch\s+(?P<epoch>\d+)\s+\|\s+Train Loss:\s+(?P<loss>[0-9.eE+-]+)")
 SMOKE_SAMPLE_SCRIPT = r"""
@@ -136,7 +151,12 @@ def parse_args():
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--eval_jsonl", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr_scheduler", type=str, default="constant", choices=sorted(ALLOWED_LR_SCHEDULERS))
+    parser.add_argument("--lr_warmup_steps", type=int, default=0)
+    parser.add_argument("--lr_warmup_ratio", type=float, default=0.0)
+    parser.add_argument("--lr_min_ratio", type=float, default=0.0)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_clip_max_norm", type=float, default=2.0)
     parser.add_argument("--num_epochs", type=int, default=3)
@@ -192,14 +212,15 @@ def validate_sweep_config(config):
         raise ValueError("only metric=eval_loss is supported")
     if config.get("direction", "minimize") != "minimize":
         raise ValueError("only direction=minimize is supported")
-    params = config.get("params")
-    if not isinstance(params, dict) or not params:
-        raise ValueError("sweep config requires a non-empty params object")
+    params = normalized_sweep_params(config)
+    if not params:
+        raise ValueError("sweep config requires at least one parameter in params, optimizer.params, or scheduler.params")
     unknown = sorted(set(params) - ALLOWED_SWEEP_PARAMS)
     if unknown:
         raise ValueError(f"unsupported sweep params: {unknown}")
     if "max_trials" in config and (not isinstance(config["max_trials"], int) or config["max_trials"] <= 0):
         raise ValueError("max_trials must be a positive integer")
+    validate_overfit_stop_config(config.get("overfit_stop", {}))
     if method == "grid":
         for name, values in params.items():
             if not isinstance(values, list) or not values:
@@ -209,6 +230,54 @@ def validate_sweep_config(config):
     else:
         for name, spec in params.items():
             validate_optuna_param(name, spec)
+
+
+def normalized_sweep_params(config):
+    merged = {}
+    for path in (("params",), ("optimizer", "params"), ("scheduler", "params")):
+        source = config
+        for key in path:
+            if not isinstance(source, dict) or key not in source:
+                source = None
+                break
+            source = source[key]
+        if source is None:
+            continue
+        if not isinstance(source, dict):
+            raise ValueError(".".join(path) + " must be an object")
+        for name, spec in source.items():
+            if name in merged:
+                raise ValueError(f"duplicate sweep param {name!r} in config")
+            merged[name] = spec
+    return merged
+
+
+def validate_overfit_stop_config(raw_config):
+    if raw_config is None:
+        return
+    if not isinstance(raw_config, dict):
+        raise ValueError("overfit_stop must be an object")
+    known = set(DEFAULT_OVERFIT_STOP_CONFIG)
+    unknown = sorted(set(raw_config) - known)
+    if unknown:
+        raise ValueError(f"unsupported overfit_stop fields: {unknown}")
+    if "enabled" in raw_config and not isinstance(raw_config["enabled"], bool):
+        raise ValueError("overfit_stop.enabled must be a boolean")
+    for name in ("min_epochs", "patience"):
+        if name in raw_config and (not isinstance(raw_config[name], int) or raw_config[name] <= 0):
+            raise ValueError(f"overfit_stop.{name} must be a positive integer")
+    for name in ("min_eval_regression_ratio", "min_train_improvement_ratio"):
+        if name in raw_config and (not isinstance(raw_config[name], (int, float)) or float(raw_config[name]) < 0):
+            raise ValueError(f"overfit_stop.{name} must be a non-negative number")
+
+
+def normalized_overfit_stop_config(config):
+    raw_config = config.get("overfit_stop", {}) or {}
+    policy = dict(DEFAULT_OVERFIT_STOP_CONFIG)
+    policy.update(raw_config)
+    policy["min_eval_regression_ratio"] = float(policy["min_eval_regression_ratio"])
+    policy["min_train_improvement_ratio"] = float(policy["min_train_improvement_ratio"])
+    return policy
 
 
 def validate_optuna_param(name, spec):
@@ -239,10 +308,18 @@ def validate_optuna_param(name, spec):
 
 
 def validate_training_args(values):
-    int_positive = ["batch_size", "num_epochs", "checkpoint_interval_epochs", "keep_last_checkpoints"]
-    int_nonnegative = ["eval_batch_size", "max_eval_batches"]
+    int_positive = [
+        "batch_size",
+        "gradient_accumulation_steps",
+        "num_epochs",
+        "checkpoint_interval_epochs",
+        "keep_last_checkpoints",
+    ]
+    int_nonnegative = ["eval_batch_size", "max_eval_batches", "lr_warmup_steps"]
     float_positive = ["lr"]
-    float_nonnegative = ["weight_decay", "grad_clip_max_norm"]
+    float_nonnegative = ["weight_decay", "grad_clip_max_norm", "lr_warmup_ratio", "lr_min_ratio"]
+    if values["lr_scheduler"] not in ALLOWED_LR_SCHEDULERS:
+        raise ValueError(f"lr_scheduler must be one of {sorted(ALLOWED_LR_SCHEDULERS)}")
     for name in int_positive:
         if int(values[name]) <= 0:
             raise ValueError(f"{name} must be positive")
@@ -257,10 +334,26 @@ def validate_training_args(values):
             raise ValueError(f"{name} must be non-negative")
     if int(values["eval_interval_epochs"]) < 0:
         raise ValueError("eval_interval_epochs must be non-negative")
+    if not 0 <= float(values["lr_warmup_ratio"]) < 1:
+        raise ValueError("lr_warmup_ratio must be greater than or equal to 0 and less than 1")
+    if not 0 <= float(values["lr_min_ratio"]) <= 1:
+        raise ValueError("lr_min_ratio must be between 0 and 1")
 
 
 def validate_single_param(name, value):
-    if name in {"batch_size", "num_epochs", "eval_batch_size", "max_eval_batches"}:
+    if name == "lr_scheduler":
+        if value not in ALLOWED_LR_SCHEDULERS:
+            raise ValueError(f"lr_scheduler values must be one of {sorted(ALLOWED_LR_SCHEDULERS)}")
+        validate_training_args({**base_param_defaults(), name: value})
+        return
+    if name in {
+        "batch_size",
+        "gradient_accumulation_steps",
+        "num_epochs",
+        "eval_batch_size",
+        "max_eval_batches",
+        "lr_warmup_steps",
+    }:
         if not isinstance(value, int):
             raise ValueError(f"{name} values must be integers")
     else:
@@ -272,7 +365,12 @@ def validate_single_param(name, value):
 def base_param_defaults():
     return {
         "batch_size": 2,
+        "gradient_accumulation_steps": 4,
         "lr": 2e-5,
+        "lr_scheduler": "constant",
+        "lr_warmup_steps": 0,
+        "lr_warmup_ratio": 0.0,
+        "lr_min_ratio": 0.0,
         "weight_decay": 0.01,
         "grad_clip_max_norm": 2.0,
         "num_epochs": 3,
@@ -286,12 +384,13 @@ def base_param_defaults():
 
 def run_grid(args, config, trials_jsonl):
     records = []
-    trial_params = list(iter_grid_params(config["params"]))
+    trial_params = list(iter_grid_params(normalized_sweep_params(config)))
     max_trials = config.get("max_trials")
+    overfit_stop_config = normalized_overfit_stop_config(config)
     if max_trials is not None:
         trial_params = trial_params[:max_trials]
     for index, params in enumerate(trial_params):
-        record = run_trial(args, index, params, dry_run=args.dry_run)
+        record = run_trial(args, index, params, overfit_stop_config=overfit_stop_config, dry_run=args.dry_run)
         records.append(record)
         append_jsonl(trials_jsonl, record)
     return records
@@ -324,10 +423,18 @@ def run_optuna_tpe(args, config, trials_jsonl):
 
     study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
     max_trials = int(config.get("max_trials", 10))
+    overfit_stop_config = normalized_overfit_stop_config(config)
 
     def objective(trial):
-        params = suggest_trial_params(trial, config["params"])
-        record = run_trial(args, trial.number, params, optuna_trial=trial, dry_run=args.dry_run)
+        params = suggest_trial_params(trial, normalized_sweep_params(config))
+        record = run_trial(
+            args,
+            trial.number,
+            params,
+            optuna_trial=trial,
+            overfit_stop_config=overfit_stop_config,
+            dry_run=args.dry_run,
+        )
         records.append(record)
         append_jsonl(trials_jsonl, record)
         if record["status"] == "pruned":
@@ -355,7 +462,7 @@ def suggest_trial_params(trial, params):
     return suggested
 
 
-def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
+def run_trial(args, index, params, *, optuna_trial=None, overfit_stop_config=None, dry_run=False):
     trial_id = f"trial-{index:04d}"
     output_root = Path(args.output_root)
     trial_dir = output_root / "trials" / trial_id
@@ -365,6 +472,8 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
     merged_params = build_trial_params(args, params)
     validate_training_args({**base_param_defaults(), **merged_params})
     command = build_sft_command(args, trial_dir, merged_params)
+    overfit_stop_policy = overfit_stop_config or dict(DEFAULT_OVERFIT_STOP_CONFIG)
+    best_checkpoint_path = str(trial_dir / BEST_CHECKPOINT_NAME) if args.eval_jsonl else None
     metrics_path.write_text("", encoding="utf-8")
     record = {
         "trial_id": trial_id,
@@ -374,7 +483,8 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
             "checkpoint_interval_epochs": merged_params["num_epochs"],
             "keep_last_checkpoints": 1,
             "retain_trial_checkpoints": False,
-            "save_best_eval_checkpoint": False,
+            "save_best_eval_checkpoint": bool(args.eval_jsonl),
+            "best_checkpoint_name": BEST_CHECKPOINT_NAME if args.eval_jsonl else None,
         },
         "command": command,
         "output_model_path": str(trial_dir),
@@ -389,10 +499,14 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
         "best_eval_epoch": None,
         "checkpoint_path": None,
         "checkpoint_epoch": None,
-        "best_checkpoint_path": str(trial_dir / f"checkpoint-epoch-{merged_params['num_epochs']}"),
+        "best_checkpoint_path": best_checkpoint_path,
         "promoted_checkpoint_path": None,
         "checkpoint_deleted": False,
         "best_checkpoint_deleted": False,
+        "overfit_stop_policy": overfit_stop_policy,
+        "overfit_stop_reason": None,
+        "overfit_stop_epoch": None,
+        "overfit_stop_metrics": None,
         "sample": None,
         "returncode": None,
         "duration_sec": 0.0,
@@ -407,6 +521,7 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
 
     start_time = time.monotonic()
     pruned = False
+    overfit_stop = None
     script_dir = Path(__file__).resolve().parent
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
@@ -428,14 +543,22 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
                     write_metrics_jsonl(metrics_path, record)
                 if updated["eval"] and optuna_trial is not None:
                     optuna_trial.report(event["eval_loss"], step=event["epoch"])
-                    if optuna_trial.should_prune():
+                if updated["eval"]:
+                    overfit_stop = detect_overfit_stop(record, event, overfit_stop_policy)
+                    if overfit_stop is not None:
+                        apply_overfit_stop_record(record, overfit_stop)
+                        print(format_overfit_stop_line(trial_id, overfit_stop))
+                        print(SWEEP_OVERFIT_JSON_PREFIX + json.dumps(overfit_stop, sort_keys=True))
+                        process.terminate()
+                        break
+                    if optuna_trial is not None and optuna_trial.should_prune():
                         pruned = True
                         print(f"sweep_trial_pruned={trial_id} epoch={event['epoch']} eval_loss={event['eval_loss']}")
                         process.terminate()
                         break
-            if pruned:
+            if pruned or overfit_stop is not None:
                 break
-        if pruned:
+        if pruned or overfit_stop is not None:
             try:
                 returncode = process.wait(timeout=60)
             except subprocess.TimeoutExpired:
@@ -448,17 +571,14 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
     record["duration_sec"] = round(time.monotonic() - start_time, 3)
     if pruned:
         record["status"] = "pruned"
+    elif overfit_stop is not None:
+        record["status"] = "overfit_stopped"
+        checkpoint = require_best_eval_checkpoint(record, trial_dir)
+        attach_checkpoint_and_sample(args, record, checkpoint)
     elif returncode == 0:
         record["status"] = "completed"
-        checkpoint = find_trial_checkpoint(trial_dir)
-        if checkpoint:
-            record["checkpoint_path"] = str(checkpoint)
-            record["checkpoint_epoch"] = checkpoint_epoch_number(checkpoint)
-            record["best_checkpoint_path"] = str(checkpoint)
-            sample = generate_smoke_sample(args, record, Path(checkpoint))
-            if sample is not None:
-                record["sample"] = sample
-                append_jsonl(Path(args.output_root) / "samples.jsonl", sample)
+        checkpoint = require_best_eval_checkpoint(record, trial_dir)
+        attach_checkpoint_and_sample(args, record, checkpoint)
     else:
         record["status"] = "failed"
     (trial_dir / "trial.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -470,7 +590,12 @@ def run_trial(args, index, params, *, optuna_trial=None, dry_run=False):
 def build_trial_params(args, overrides):
     params = {
         "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "lr": args.lr,
+        "lr_scheduler": args.lr_scheduler,
+        "lr_warmup_steps": args.lr_warmup_steps,
+        "lr_warmup_ratio": args.lr_warmup_ratio,
+        "lr_min_ratio": args.lr_min_ratio,
         "weight_decay": args.weight_decay,
         "grad_clip_max_norm": args.grad_clip_max_norm,
         "num_epochs": args.num_epochs,
@@ -494,8 +619,18 @@ def build_sft_command(args, trial_dir, params):
         str(args.train_jsonl),
         "--batch_size",
         str(params["batch_size"]),
+        "--gradient_accumulation_steps",
+        str(params["gradient_accumulation_steps"]),
         "--lr",
         str(params["lr"]),
+        "--lr_scheduler",
+        str(params["lr_scheduler"]),
+        "--lr_warmup_steps",
+        str(params["lr_warmup_steps"]),
+        "--lr_warmup_ratio",
+        str(params["lr_warmup_ratio"]),
+        "--lr_min_ratio",
+        str(params["lr_min_ratio"]),
         "--weight_decay",
         str(params["weight_decay"]),
         "--grad_clip_max_norm",
@@ -519,6 +654,9 @@ def build_sft_command(args, trial_dir, params):
             str(params["eval_batch_size"]),
             "--max_eval_batches",
             str(params["max_eval_batches"]),
+            "--save_best_eval_checkpoint",
+            "--best_checkpoint_name",
+            BEST_CHECKPOINT_NAME,
         ])
     return command
 
@@ -558,7 +696,7 @@ def parse_metric_events(line):
 
 
 def update_metric_record(record, event):
-    changed = {"any": False, "train": False, "eval": False}
+    changed = {"any": False, "train": False, "eval": False, "best_eval": False}
     epoch = int(event["epoch"])
     metrics = None
     for existing in record["metrics_history"]:
@@ -586,6 +724,7 @@ def update_metric_record(record, event):
             if record["best_eval_loss"] is None or eval_loss < record["best_eval_loss"]:
                 record["best_eval_loss"] = eval_loss
                 record["best_eval_epoch"] = epoch
+                changed["best_eval"] = True
             changed["any"] = True
             changed["eval"] = True
 
@@ -593,6 +732,75 @@ def update_metric_record(record, event):
     record["train_history"].sort(key=lambda item: item["epoch"])
     record["eval_history"].sort(key=lambda item: item["epoch"])
     return changed
+
+
+def detect_overfit_stop(record, event, policy):
+    if not policy.get("enabled", False):
+        return None
+    epoch = int(event["epoch"])
+    if epoch < int(policy["min_epochs"]):
+        return None
+    best_eval_loss = record.get("best_eval_loss")
+    best_eval_epoch = record.get("best_eval_epoch")
+    if best_eval_loss is None or best_eval_epoch is None or epoch <= int(best_eval_epoch):
+        return None
+    current_eval_loss = float(event["eval_loss"])
+    current_train_loss = metric_value_at_epoch(record, epoch, "train_loss")
+    best_train_loss = metric_value_at_epoch(record, int(best_eval_epoch), "train_loss")
+    if current_train_loss is None or best_train_loss is None:
+        return None
+
+    evals_since_best = sum(1 for item in record["eval_history"] if item["epoch"] > int(best_eval_epoch))
+    if evals_since_best < int(policy["patience"]):
+        return None
+    eval_threshold = float(best_eval_loss) * (1.0 + float(policy["min_eval_regression_ratio"]))
+    train_threshold = float(best_train_loss) * (1.0 - float(policy["min_train_improvement_ratio"]))
+    if current_eval_loss < eval_threshold:
+        return None
+    if float(current_train_loss) > train_threshold:
+        return None
+
+    return {
+        "trial_id": record["trial_id"],
+        "reason": "eval_regressed_while_train_improved",
+        "epoch": epoch,
+        "eval_loss": current_eval_loss,
+        "train_loss": float(current_train_loss),
+        "best_eval_loss": float(best_eval_loss),
+        "best_eval_epoch": int(best_eval_epoch),
+        "best_train_loss": float(best_train_loss),
+        "evals_since_best": int(evals_since_best),
+        "min_epochs": int(policy["min_epochs"]),
+        "patience": int(policy["patience"]),
+        "min_eval_regression_ratio": float(policy["min_eval_regression_ratio"]),
+        "min_train_improvement_ratio": float(policy["min_train_improvement_ratio"]),
+    }
+
+
+def metric_value_at_epoch(record, epoch, key):
+    for metrics in record["metrics_history"]:
+        if int(metrics["epoch"]) == int(epoch) and key in metrics:
+            return float(metrics[key])
+    return None
+
+
+def apply_overfit_stop_record(record, overfit_stop):
+    record["overfit_stop_reason"] = overfit_stop["reason"]
+    record["overfit_stop_epoch"] = overfit_stop["epoch"]
+    record["overfit_stop_metrics"] = overfit_stop
+
+
+def format_overfit_stop_line(trial_id, overfit_stop):
+    return (
+        f"sweep_trial_overfit_stop={trial_id} "
+        f"epoch={overfit_stop['epoch']} "
+        f"eval_loss={overfit_stop['eval_loss']} "
+        f"best_eval_loss={overfit_stop['best_eval_loss']} "
+        f"best_eval_epoch={overfit_stop['best_eval_epoch']} "
+        f"train_loss={overfit_stop['train_loss']} "
+        f"best_train_loss={overfit_stop['best_train_loss']} "
+        f"reason={overfit_stop['reason']}"
+    )
 
 
 def upsert_epoch_history(history, epoch, key, value):
@@ -613,7 +821,7 @@ def select_best_trial(records):
     completed = [
         record
         for record in records
-        if record["status"] == "completed" and record["best_eval_loss"] is not None
+        if record["status"] in {"completed", "overfit_stopped"} and record["best_eval_loss"] is not None
     ]
     if not completed:
         return None
@@ -629,6 +837,25 @@ def find_trial_checkpoint(trial_dir):
     if not candidates:
         return None
     return max(candidates, key=checkpoint_epoch_number)
+
+
+def require_best_eval_checkpoint(record, trial_dir):
+    checkpoint = Path(record["best_checkpoint_path"] or Path(trial_dir) / BEST_CHECKPOINT_NAME)
+    if record.get("best_eval_loss") is None:
+        raise RuntimeError(f"{record['trial_id']} did not produce eval_loss")
+    if not checkpoint.is_dir():
+        raise FileNotFoundError(f"{record['trial_id']} best eval checkpoint is missing: {checkpoint}")
+    return checkpoint
+
+
+def attach_checkpoint_and_sample(args, record, checkpoint):
+    record["checkpoint_path"] = str(checkpoint)
+    record["checkpoint_epoch"] = record["best_eval_epoch"]
+    record["best_checkpoint_path"] = str(checkpoint)
+    sample = generate_smoke_sample(args, record, Path(checkpoint))
+    if sample is not None:
+        record["sample"] = sample
+        append_jsonl(Path(args.output_root) / "samples.jsonl", sample)
 
 
 def checkpoint_epoch_number(path):
@@ -651,8 +878,13 @@ def promote_best_checkpoint(best, target):
 
 def delete_trial_checkpoints(output_root):
     deleted = []
-    for checkpoint in sorted(Path(output_root).glob("trials/trial-*/checkpoint-epoch-*")):
-        if checkpoint.is_dir():
+    for trial_dir in sorted(Path(output_root).glob("trials/trial-*")):
+        checkpoints = []
+        best_checkpoint = trial_dir / BEST_CHECKPOINT_NAME
+        if best_checkpoint.is_dir():
+            checkpoints.append(best_checkpoint)
+        checkpoints.extend(path for path in trial_dir.glob("checkpoint-epoch-*") if path.is_dir())
+        for checkpoint in sorted(checkpoints):
             shutil.rmtree(checkpoint)
             deleted.append(str(checkpoint))
             print(f"deleted_trial_checkpoint={checkpoint}")
@@ -752,7 +984,12 @@ def sample_filename(record):
 def format_trial_params(params):
     ordered = [
         ("batch_size", params["batch_size"]),
+        ("gradient_accumulation_steps", params["gradient_accumulation_steps"]),
         ("lr", params["lr"]),
+        ("lr_scheduler", params["lr_scheduler"]),
+        ("lr_warmup_steps", params["lr_warmup_steps"]),
+        ("lr_warmup_ratio", params["lr_warmup_ratio"]),
+        ("lr_min_ratio", params["lr_min_ratio"]),
         ("weight_decay", params["weight_decay"]),
         ("grad_clip_max_norm", params["grad_clip_max_norm"]),
         ("num_epochs", params["num_epochs"]),
@@ -763,6 +1000,8 @@ def format_trial_params(params):
 
 
 def format_sample_param(value):
+    if isinstance(value, str):
+        return value
     if isinstance(value, int):
         return str(value)
     value = float(value)

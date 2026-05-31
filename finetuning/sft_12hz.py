@@ -15,6 +15,7 @@
 # limitations under the License.
 import argparse
 import json
+import math
 import os
 import shutil
 
@@ -155,7 +156,12 @@ def train():
     parser.add_argument("--output_model_path", type=str, default="output")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr_scheduler", type=str, default="constant", choices=["constant", "linear", "cosine"])
+    parser.add_argument("--lr_warmup_steps", type=int, default=0)
+    parser.add_argument("--lr_warmup_ratio", type=float, default=0.0)
+    parser.add_argument("--lr_min_ratio", type=float, default=0.0)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_clip_max_norm", type=float, default=2.0)
     parser.add_argument("--num_epochs", type=int, default=3)
@@ -169,6 +175,14 @@ def train():
     parser.add_argument("--best_checkpoint_name", type=str, default="checkpoint-best")
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     args = parser.parse_args()
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if args.lr_warmup_steps < 0:
+        raise ValueError("lr_warmup_steps must be non-negative")
+    if not 0 <= args.lr_warmup_ratio < 1:
+        raise ValueError("lr_warmup_ratio must be greater than or equal to 0 and less than 1")
+    if not 0 <= args.lr_min_ratio <= 1:
+        raise ValueError("lr_min_ratio must be between 0 and 1")
     if args.checkpoint_interval_epochs <= 0:
         raise ValueError("checkpoint_interval_epochs must be positive")
     if args.keep_last_checkpoints <= 0:
@@ -190,7 +204,13 @@ def train():
     if os.path.basename(args.best_checkpoint_name) != args.best_checkpoint_name:
         raise ValueError("best_checkpoint_name must be a single directory name")
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
+    if args.gradient_accumulation_steps == 4:
+        accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
+    else:
+        accelerator = Accelerator(
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            mixed_precision="bf16",
+        )
 
     MODEL_PATH = args.init_model_path
 
@@ -218,20 +238,37 @@ def train():
             collate_fn=eval_dataset.collate_fn,
         )
 
+    num_epochs = args.num_epochs
     optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    total_training_steps = max(1, len(train_dataloader) * num_epochs)
+    lr_scheduler = build_lr_scheduler(optimizer, args, total_training_steps)
 
     if eval_dataloader is None:
-        model, optimizer, train_dataloader = accelerator.prepare(
-            qwen3tts.model, optimizer, train_dataloader
+        model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            qwen3tts.model, optimizer, train_dataloader, lr_scheduler
         )
     else:
-        model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-            qwen3tts.model, optimizer, train_dataloader, eval_dataloader
+        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+            qwen3tts.model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
         )
 
-    num_epochs = args.num_epochs
     best_eval_loss = None
     model.train()
+    accelerator.print(
+        "SFT_OPTIMIZER_JSON " + json.dumps(
+            {
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "lr": args.lr,
+                "lr_min_ratio": args.lr_min_ratio,
+                "lr_scheduler": args.lr_scheduler,
+                "lr_warmup_ratio": args.lr_warmup_ratio,
+                "lr_warmup_steps": effective_warmup_steps(args, total_training_steps),
+                "total_training_steps": total_training_steps,
+                "weight_decay": args.weight_decay,
+            },
+            sort_keys=True,
+        )
+    )
 
     for epoch in range(num_epochs):
         epoch_losses = []
@@ -246,6 +283,7 @@ def train():
                     accelerator.clip_grad_norm_(model.parameters(), args.grad_clip_max_norm)
 
                 optimizer.step()
+                lr_scheduler.step()
                 optimizer.zero_grad()
 
             if step % 10 == 0:
@@ -314,6 +352,35 @@ def train():
             for checkpoint_to_delete in checkpoint_dirs[:-args.keep_last_checkpoints]:
                 shutil.rmtree(checkpoint_to_delete)
                 print(f"Deleted old checkpoint: {checkpoint_to_delete}")
+
+
+def effective_warmup_steps(args, total_training_steps):
+    if args.lr_warmup_steps > 0:
+        return min(args.lr_warmup_steps, max(0, total_training_steps - 1))
+    return int(total_training_steps * args.lr_warmup_ratio)
+
+
+def build_lr_scheduler(optimizer, args, total_training_steps):
+    warmup_steps = effective_warmup_steps(args, total_training_steps)
+    anneal_steps = max(1, total_training_steps - warmup_steps)
+
+    def lr_lambda(current_step):
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return max(float(current_step) / float(warmup_steps), 1e-8)
+
+        if args.lr_scheduler == "constant":
+            return 1.0
+
+        progress = min(1.0, max(0.0, float(current_step - warmup_steps) / float(anneal_steps)))
+        if args.lr_scheduler == "linear":
+            return args.lr_min_ratio + (1.0 - args.lr_min_ratio) * (1.0 - progress)
+        if args.lr_scheduler == "cosine":
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return args.lr_min_ratio + (1.0 - args.lr_min_ratio) * cosine
+        raise ValueError(f"unsupported lr_scheduler: {args.lr_scheduler}")
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
 
 if __name__ == "__main__":
     train()
