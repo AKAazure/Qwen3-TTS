@@ -35,6 +35,7 @@ EPOCH_JSON_PREFIX = "SFT_EPOCH_JSON "
 SWEEP_TRIAL_JSON_PREFIX = "SFT_SWEEP_TRIAL_JSON "
 SWEEP_OVERFIT_JSON_PREFIX = "SFT_SWEEP_OVERFIT_JSON "
 BEST_CHECKPOINT_NAME = "checkpoint-best"
+RETAINED_BEST_CHECKPOINT_DIRNAME = "_retained_best_checkpoint"
 DEFAULT_OVERFIT_STOP_CONFIG = {
     "enabled": False,
     "min_epochs": 10,
@@ -131,10 +132,16 @@ def main():
         print(f"promoted_checkpoint={promoted}")
     if not args.dry_run:
         deleted_checkpoints = delete_trial_checkpoints(output_root)
-        mark_deleted_checkpoints(records, deleted_checkpoints)
+        if deleted_checkpoints:
+            mark_deleted_checkpoints(records, deleted_checkpoints)
+        deleted_retained = delete_retained_best_checkpoint(output_root)
+        if deleted_retained:
+            clear_retained_checkpoint_path(records, deleted_retained)
+            if best.get("retained_best_checkpoint_path") == deleted_retained:
+                best["retained_best_checkpoint_path"] = None
         rewrite_trial_records(records, trials_jsonl)
-        best["trial_checkpoints_deleted"] = len(deleted_checkpoints)
-        print(f"trial_checkpoints_deleted={len(deleted_checkpoints)}")
+        best["trial_checkpoints_deleted"] = best.get("trial_checkpoints_deleted", 0)
+        print(f"trial_checkpoints_deleted={best['trial_checkpoints_deleted']}")
 
     best_path = output_root / "best_trial.json"
     best_path.write_text(json.dumps(best, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -384,6 +391,7 @@ def base_param_defaults():
 
 def run_grid(args, config, trials_jsonl):
     records = []
+    best_record = None
     trial_params = list(iter_grid_params(normalized_sweep_params(config)))
     max_trials = config.get("max_trials")
     overfit_stop_config = normalized_overfit_stop_config(config)
@@ -391,6 +399,12 @@ def run_grid(args, config, trials_jsonl):
         trial_params = trial_params[:max_trials]
     for index, params in enumerate(trial_params):
         record = run_trial(args, index, params, overfit_stop_config=overfit_stop_config, dry_run=args.dry_run)
+        best_record = retain_best_checkpoint_candidate(record, best_record, Path(args.output_root), dry_run=args.dry_run)
+        if not args.dry_run:
+            deleted = delete_trial_checkpoints_in_trial_dir(Path(record["output_model_path"]))
+            record["trial_checkpoints_deleted"] = len(deleted)
+            if deleted:
+                mark_deleted_checkpoints([record], deleted)
         records.append(record)
         append_jsonl(trials_jsonl, record)
     return records
@@ -409,6 +423,7 @@ def run_optuna_tpe(args, config, trials_jsonl):
         raise RuntimeError("optuna_tpe sweep requires `python3 -m pip install optuna`") from error
 
     records = []
+    best_record = None
     seed = int(config.get("seed", 42))
     sampler = optuna.samplers.TPESampler(seed=seed)
     pruner_name = config.get("pruner", "successive_halving")
@@ -426,6 +441,7 @@ def run_optuna_tpe(args, config, trials_jsonl):
     overfit_stop_config = normalized_overfit_stop_config(config)
 
     def objective(trial):
+        nonlocal best_record
         params = suggest_trial_params(trial, normalized_sweep_params(config))
         record = run_trial(
             args,
@@ -435,6 +451,12 @@ def run_optuna_tpe(args, config, trials_jsonl):
             overfit_stop_config=overfit_stop_config,
             dry_run=args.dry_run,
         )
+        best_record = retain_best_checkpoint_candidate(record, best_record, Path(args.output_root), dry_run=args.dry_run)
+        if not args.dry_run:
+            deleted = delete_trial_checkpoints_in_trial_dir(Path(record["output_model_path"]))
+            record["trial_checkpoints_deleted"] = len(deleted)
+            if deleted:
+                mark_deleted_checkpoints([record], deleted)
         records.append(record)
         append_jsonl(trials_jsonl, record)
         if record["status"] == "pruned":
@@ -480,7 +502,7 @@ def run_trial(args, index, params, *, optuna_trial=None, overfit_stop_config=Non
         "status": "dry_run" if dry_run else "running",
         "params": merged_params,
         "checkpoint_policy": {
-            "checkpoint_interval_epochs": merged_params["num_epochs"],
+            "checkpoint_interval_epochs": args.checkpoint_interval_epochs,
             "keep_last_checkpoints": 1,
             "retain_trial_checkpoints": False,
             "save_best_eval_checkpoint": bool(args.eval_jsonl),
@@ -500,9 +522,11 @@ def run_trial(args, index, params, *, optuna_trial=None, overfit_stop_config=Non
         "checkpoint_path": None,
         "checkpoint_epoch": None,
         "best_checkpoint_path": best_checkpoint_path,
+        "retained_best_checkpoint_path": None,
         "promoted_checkpoint_path": None,
         "checkpoint_deleted": False,
         "best_checkpoint_deleted": False,
+        "trial_checkpoints_deleted": 0,
         "overfit_stop_policy": overfit_stop_policy,
         "overfit_stop_reason": None,
         "overfit_stop_epoch": None,
@@ -583,6 +607,11 @@ def run_trial(args, index, params, *, optuna_trial=None, overfit_stop_config=Non
         record["status"] = "failed"
     (trial_dir / "trial.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if record["status"] == "failed":
+        deleted = delete_trial_checkpoints_in_trial_dir(trial_dir)
+        record["trial_checkpoints_deleted"] = len(deleted)
+        if deleted:
+            mark_deleted_checkpoints([record], deleted)
+            (trial_dir / "trial.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         raise RuntimeError(f"{trial_id} failed with exit code {returncode}; see {log_path}")
     return record
 
@@ -638,7 +667,7 @@ def build_sft_command(args, trial_dir, params):
         "--num_epochs",
         str(params["num_epochs"]),
         "--checkpoint_interval_epochs",
-        str(params["num_epochs"]),
+        str(args.checkpoint_interval_epochs),
         "--keep_last_checkpoints",
         "1",
         "--speaker_name",
@@ -866,7 +895,7 @@ def checkpoint_epoch_number(path):
 
 
 def promote_best_checkpoint(best, target):
-    source = Path(best["best_checkpoint_path"])
+    source = Path(best.get("retained_best_checkpoint_path") or best["best_checkpoint_path"])
     if not source.exists():
         raise FileNotFoundError(f"best checkpoint does not exist: {source}")
     if target.exists():
@@ -891,6 +920,21 @@ def delete_trial_checkpoints(output_root):
     return deleted
 
 
+def delete_trial_checkpoints_in_trial_dir(trial_dir):
+    deleted = []
+    checkpoints = []
+    trial_dir = Path(trial_dir)
+    best_checkpoint = trial_dir / BEST_CHECKPOINT_NAME
+    if best_checkpoint.is_dir():
+        checkpoints.append(best_checkpoint)
+    checkpoints.extend(path for path in trial_dir.glob("checkpoint-epoch-*") if path.is_dir())
+    for checkpoint in sorted(checkpoints):
+        shutil.rmtree(checkpoint)
+        deleted.append(str(checkpoint))
+        print(f"deleted_trial_checkpoint={checkpoint}")
+    return deleted
+
+
 def mark_deleted_checkpoints(records, deleted_checkpoints):
     deleted = set(deleted_checkpoints)
     for record in records:
@@ -911,6 +955,44 @@ def rewrite_trial_records(records, trials_jsonl):
         append_jsonl(trials_jsonl, record)
         trial_json = Path(record["output_model_path"]) / "trial.json"
         trial_json.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def retain_best_checkpoint_candidate(record, current_best_record, output_root, *, dry_run=False):
+    if dry_run:
+        return current_best_record
+    if record["status"] not in {"completed", "overfit_stopped"} or record["best_eval_loss"] is None:
+        return current_best_record
+    if current_best_record is not None and current_best_record["best_eval_loss"] <= record["best_eval_loss"]:
+        return current_best_record
+
+    source = Path(record["best_checkpoint_path"])
+    if not source.is_dir():
+        raise FileNotFoundError(f"{record['trial_id']} best checkpoint is missing before retention: {source}")
+
+    staging_dir = Path(output_root) / RETAINED_BEST_CHECKPOINT_DIRNAME
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    shutil.copytree(source, staging_dir)
+    record["retained_best_checkpoint_path"] = str(staging_dir)
+    print(f"retained_best_checkpoint={staging_dir}")
+    if current_best_record is not None:
+        current_best_record["retained_best_checkpoint_path"] = None
+    return record
+
+
+def delete_retained_best_checkpoint(output_root):
+    retained = Path(output_root) / RETAINED_BEST_CHECKPOINT_DIRNAME
+    if retained.is_dir():
+        shutil.rmtree(retained)
+        print(f"deleted_retained_best_checkpoint={retained}")
+        return str(retained)
+    return None
+
+
+def clear_retained_checkpoint_path(records, deleted_retained):
+    for record in records:
+        if record.get("retained_best_checkpoint_path") == deleted_retained:
+            record["retained_best_checkpoint_path"] = None
 
 
 def generate_smoke_sample(args, record, checkpoint):
